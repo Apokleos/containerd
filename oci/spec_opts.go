@@ -235,6 +235,14 @@ func WithMounts(mounts []specs.Mount) SpecOpts {
 	}
 }
 
+//WithLinuxDevices appends host devices
+func WithLinuxDevices(devices []specs.LinuxDevice) SpecOpts {
+	return func(_ context.Context, _ Client, _ *containers.Container, s *Spec) error {
+		s.Linux.Devices = append(s.Linux.Devices, devices... )
+		return nil
+	}
+}
+
 // WithHostNamespace allows a task to run inside the host's linux namespace
 func WithHostNamespace(ns specs.LinuxNamespaceType) SpecOpts {
 	return func(_ context.Context, _ Client, _ *containers.Container, s *Spec) error {
