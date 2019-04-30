@@ -65,6 +65,8 @@ const (
 	unconfinedProfile = "unconfined"
 	// seccompDefaultProfile is the default seccomp profile.
 	seccompDefaultProfile = dockerDefault
+	//vfioDevicePath is the specified vfio Devices Path
+	vfioDevicePath = "vfio.device.hostpath"
 )
 
 func init() {
@@ -222,6 +224,14 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	}
 	if userstr != "" {
 		specOpts = append(specOpts, oci.WithUser(userstr))
+	}
+
+	VFIODevPath, vfioExist := sandboxConfig.GetAnnotations()[vfioDevicePath]
+	logrus.Infof("VFIODevPath: %+v", VFIODevPath)
+	if vfioExist {
+		specOpts = append(specOpts, oci.WithPrivileged)
+		hostDevices := oci.SetDevices(spec, VFIODevPath)
+		specOpts = append(specOpts, oci.WithLinuxDevices(hostDevices))
 	}
 
 	if securityContext.GetRunAsUsername() != "" {
