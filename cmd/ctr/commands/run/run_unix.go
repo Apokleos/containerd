@@ -70,6 +70,7 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 		opts = append(opts, oci.WithDefaultSpec(), oci.WithDefaultUnixDevices)
 		opts = append(opts, oci.WithEnv(context.StringSlice("env")))
 		opts = append(opts, withMounts(context))
+		opts = append(opts, withLinuxDevices(context))
 
 		if context.Bool("rootfs") {
 			rootfs, err := filepath.Abs(ref)
