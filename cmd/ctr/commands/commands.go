@@ -128,6 +128,10 @@ var (
 			Name:  "allow-new-privs",
 			Usage: "turn off OCI spec's NoNewPrivileges feature flag",
 		},
+		cli.StringSliceFlag{
+			Name:  "device",
+			Usage: "add host devices to specified container (ex: --device /vfio/dev/N)",
+		},
 	}
 )
 
