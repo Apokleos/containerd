@@ -35,6 +35,59 @@ import (
 	"github.com/urfave/cli"
 )
 
+type DeviceMapping struct {
+	PathOnHost        string
+	PathInContainer   string
+	CgroupPermissions string
+}
+
+func setDevices(s *specs.Spec, HostDevices []DeviceMapping) []specs.LinuxDevice {
+	// Build lists of devices allowed and created within the container.
+	logrus.Info("Build lists of Devices allowed and created within the container.")
+	var devs []specs.LinuxDevice
+	devPermissions := s.Linux.Resources.Devices
+	for _, deviceMapping := range HostDevices {
+		logrus.Printf("deviceMapping: {%s, %s, %s}", deviceMapping.PathOnHost, deviceMapping.PathInContainer, deviceMapping.CgroupPermissions)
+		d, dPermissions, err := DevicesFromPath(deviceMapping.PathOnHost, deviceMapping.PathInContainer, deviceMapping.CgroupPermissions)
+		if err != nil {
+			return devs
+		}
+		devs = append(devs, d...)
+		devPermissions = append(devPermissions, dPermissions...)
+	}
+
+	//var err error
+	//Resources := *s.Linux.Resources
+	//devPermissions, err = AppendDevicePermissionsFromCgroupRules(devPermissions, Resources.Devices)
+	//if err != nil {
+	//	return devs
+	//}
+
+	s.Linux.Devices = append(s.Linux.Devices, devs...)
+	s.Linux.Resources.Devices = devPermissions
+	return devs
+}
+
+func withLinuxDevices(context *cli.Context) oci.SpecOpts {
+	logrus.Info("New Container with Linux Devices.")
+	return func(ctx gocontext.Context, client oci.Client, container *containers.Container, s *specs.Spec) error {
+		//devices := make([]specs.LinuxDevice, 0)
+		hostDevs := []DeviceMapping{}
+
+		for _, devPath := range context.StringSlice("device") {
+			hostDev := DeviceMapping{
+				PathOnHost:        devPath,
+				PathInContainer:   devPath,
+				CgroupPermissions: "rwm",
+			}
+			hostDevs = append(hostDevs, hostDev)
+			//devices = append(devices, dev)
+		}
+		devices := setDevices(s, hostDevs)
+		return oci.WithLinuxDevices(devices)(ctx, client, container, s)
+	}
+}
+
 func withMounts(context *cli.Context) oci.SpecOpts {
 	return func(ctx gocontext.Context, client oci.Client, container *containers.Container, s *specs.Spec) error {
 		mounts := make([]specs.Mount, 0)
