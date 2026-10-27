@@ -25,7 +25,8 @@ import (
 )
 
 // NOTE(random-liu):
-// 1) Metadata is immutable after created.
+// 1) Metadata values are immutable after creation. Store.UpdateConfig replaces
+// the stored Config pointer without mutating existing values.
 // 2) Metadata is checkpointed as containerd container label.
 
 // metadataVersion is current version of sandbox metadata.

@@ -22,13 +22,49 @@ import (
 	"fmt"
 
 	"github.com/containerd/containerd/v2/core/sandbox"
+	"github.com/containerd/containerd/v2/internal/cri/server/podsandbox"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
+	"google.golang.org/protobuf/proto"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
+
+const restoreAnnotation = "io.containerd.restore"
+
+type podRestoreContextKey struct{}
+
+func withPodRestore(ctx context.Context) context.Context {
+	return context.WithValue(ctx, podRestoreContextKey{}, struct{}{})
+}
+
+func isPodRestore(ctx context.Context) bool {
+	_, ok := ctx.Value(podRestoreContextKey{}).(struct{})
+	return ok
+}
+
+func rejectExternalRestoreAnnotation(config *runtime.PodSandboxConfig) error {
+	if _, ok := config.GetAnnotations()[restoreAnnotation]; ok {
+		return fmt.Errorf("sandbox annotation %q is reserved for containerd restore", restoreAnnotation)
+	}
+	return nil
+}
+
+func hasRestoreAnnotation(config *runtime.PodSandboxConfig) bool {
+	return config.GetAnnotations()[restoreAnnotation] == "true"
+}
+
+func sandboxRestoreInProgress(sb sandboxstore.Sandbox) bool {
+	return sb.Status.Get().State == sandboxstore.StateUnknown &&
+		hasRestoreAnnotation(sb.Config)
+}
+
+func sandboxRestorePending(sb sandboxstore.Sandbox) bool {
+	return sb.Status.Get().State != sandboxstore.StateReady &&
+		hasRestoreAnnotation(sb.Config)
+}
 
 // CheckpointPod coordinates CRI-owned Pod validation and delegates the
 // implementation-specific checkpoint transaction to the sandbox controller.
@@ -86,6 +122,9 @@ func (c *criService) RestorePod(ctx context.Context, r *runtime.RestorePodReques
 	if err := c.checkPodCheckpointSupport(); err != nil {
 		return nil, fmt.Errorf("pod restore is unavailable: %w", err)
 	}
+	if err := rejectExternalRestoreAnnotation(r.GetConfig()); err != nil {
+		return nil, err
+	}
 
 	opts, err := restoreOptionsFromCRI(r)
 	if err != nil {
@@ -115,6 +154,7 @@ type podRestoreOperations interface {
 	RemovePodSandbox(context.Context, *runtime.RemovePodSandboxRequest) (*runtime.RemovePodSandboxResponse, error)
 	saveContainerTaskCheckpoint(string, string) error
 	deleteTaskCheckpoint(context.Context, string) error
+	publishRestoredSandbox(context.Context, string) error
 }
 
 func restorePodResources(
@@ -127,8 +167,22 @@ func restorePodResources(
 	if len(request.GetContainerConfigs()) != len(opts.Containers) {
 		return nil, fmt.Errorf("restore options contain %d containers, but request contains %d", len(opts.Containers), len(request.GetContainerConfigs()))
 	}
+
+	restoreConfig := proto.Clone(request.GetConfig()).(*runtime.PodSandboxConfig)
+	if restoreConfig.Annotations == nil {
+		restoreConfig.Annotations = make(map[string]string)
+	}
+	restoreConfig.Annotations[restoreAnnotation] = "true"
+
+	var err error
+	opts.SandboxConfig, err = typeurl.MarshalAny(restoreConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode normalized sandbox restore config: %w", err)
+	}
+	ctx = withPodRestore(ctx)
+
 	runResponse, err := operations.RunPodSandbox(ctx, &runtime.RunPodSandboxRequest{
-		Config:         request.GetConfig(),
+		Config:         restoreConfig,
 		RuntimeHandler: request.GetRuntimeHandler(),
 	})
 	if err != nil {
@@ -169,7 +223,7 @@ func restorePodResources(
 		createResponse, err := operations.CreateContainer(ctx, &runtime.CreateContainerRequest{
 			PodSandboxId:  sandboxID,
 			Config:        config,
-			SandboxConfig: request.GetConfig(),
+			SandboxConfig: restoreConfig,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create restored container %q: %w", opts.Containers[i].Name, err)
@@ -211,9 +265,76 @@ func restorePodResources(
 			return nil, fmt.Errorf("failed to save task checkpoint image for container %q: %w", container.ID, err)
 		}
 	}
+	if err := operations.publishRestoredSandbox(ctx, sandboxID); err != nil {
+		return nil, fmt.Errorf("failed to publish restored sandbox %q: %w", sandboxID, err)
+	}
 
 	rollback = false
 	return response, nil
+}
+
+func (c *criService) publishRestoredSandbox(ctx context.Context, sandboxID string) error {
+	sb, err := c.sandboxStore.Get(sandboxID)
+	if err != nil {
+		return err
+	}
+	controllerStatus, err := c.sandboxService.SandboxStatus(ctx, sb.Sandboxer, sandboxID, false)
+	if err != nil {
+		return fmt.Errorf("failed to query restored sandbox status: %w", err)
+	}
+	if controllerStatus.SandboxID != sandboxID {
+		return fmt.Errorf("controller returned sandbox ID %q, expected %q", controllerStatus.SandboxID, sandboxID)
+	}
+	if controllerStatus.State != runtime.PodSandboxState_SANDBOX_READY.String() {
+		return fmt.Errorf("controller returned sandbox state %q, expected %q", controllerStatus.State, runtime.PodSandboxState_SANDBOX_READY.String())
+	}
+	if state := sb.Status.Get().State; state != sandboxstore.StateUnknown {
+		return fmt.Errorf("restored sandbox cannot be published from state %s: %w", state, errdefs.ErrFailedPrecondition)
+	}
+	config, err := c.clearPersistedRestoreAnnotation(ctx, sandboxID)
+	if err != nil {
+		return fmt.Errorf("failed to clear restore annotation: %w", err)
+	}
+	if err := c.sandboxStore.UpdateConfig(sandboxID, config); err != nil {
+		return fmt.Errorf("failed to update restored sandbox config: %w", err)
+	}
+	if err := sb.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
+		if status.State != sandboxstore.StateUnknown {
+			return status, fmt.Errorf("restored sandbox cannot be published from state %s: %w", status.State, errdefs.ErrFailedPrecondition)
+		}
+		status.Pid = controllerStatus.Pid
+		status.CreatedAt = controllerStatus.CreatedAt
+		status.State = sandboxstore.StateReady
+		return status, nil
+	}); err != nil {
+		return fmt.Errorf("failed to mark restored sandbox ready: %w", err)
+	}
+	c.generateAndSendContainerEvent(ctx, sandboxID, sandboxID, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
+	return nil
+}
+
+func (c *criService) clearPersistedRestoreAnnotation(ctx context.Context, sandboxID string) (*runtime.PodSandboxConfig, error) {
+	stored, err := c.client.SandboxStore().Get(ctx, sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox metadata: %w", err)
+	}
+	metadata := sandboxstore.Metadata{}
+	if err := stored.GetExtension(podsandbox.MetadataKey, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to get CRI sandbox metadata: %w", err)
+	}
+	if !hasRestoreAnnotation(metadata.Config) {
+		return nil, fmt.Errorf("persisted restore annotation is missing")
+	}
+	config := proto.Clone(metadata.Config).(*runtime.PodSandboxConfig)
+	delete(config.Annotations, restoreAnnotation)
+	metadata.Config = config
+	if err := stored.AddExtension(podsandbox.MetadataKey, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to encode CRI sandbox metadata: %w", err)
+	}
+	if _, err := c.client.SandboxStore().Update(ctx, stored, "extensions"); err != nil {
+		return nil, fmt.Errorf("failed to update sandbox metadata: %w", err)
+	}
+	return config, nil
 }
 
 func (c *criService) saveContainerTaskCheckpoint(containerID, image string) error {

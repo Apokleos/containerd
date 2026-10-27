@@ -59,6 +59,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 	config := r.GetConfig()
 	log.G(ctx).Debugf("Sandbox config %+v", config)
+	if !isPodRestore(ctx) {
+		if err := rejectExternalRestoreAnnotation(config); err != nil {
+			return nil, err
+		}
+	}
 
 	// Generate unique id and name for the sandbox and reserve the name.
 	id := util.GenerateID()
@@ -373,12 +378,14 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		}
 	}()
 
-	if err := sandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
-		// Set the pod sandbox as ready after successfully start sandbox container.
-		status.State = sandboxstore.StateReady
-		return status, nil
-	}); err != nil {
-		return nil, fmt.Errorf("failed to update sandbox status: %w", err)
+	if !isPodRestore(ctx) {
+		if err := sandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
+			// Set the pod sandbox as ready after successfully start sandbox container.
+			status.State = sandboxstore.StateReady
+			return status, nil
+		}); err != nil {
+			return nil, fmt.Errorf("failed to update sandbox status: %w", err)
+		}
 	}
 
 	// Add sandbox into sandbox store in INIT state.
@@ -405,8 +412,10 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// but we don't care about sandbox TaskOOM right now, so it is fine.
 	c.startSandboxExitMonitor(context.Background(), id, exitCh)
 
-	// Send CONTAINER_STARTED event with ContainerId equal to SandboxId.
-	c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
+	// RestorePod publishes STARTED only after the controller restore succeeds.
+	if !isPodRestore(ctx) {
+		c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
+	}
 
 	sandboxRuntimeCreateTimer.WithValues(labels["oci_runtime_type"]).UpdateSince(runtimeStart)
 

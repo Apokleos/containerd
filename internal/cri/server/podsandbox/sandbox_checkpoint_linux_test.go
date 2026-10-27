@@ -106,19 +106,50 @@ func TestCheckpointOutputReservation(t *testing.T) {
 	service := new(CheckpointService)
 	output := t.TempDir()
 
-	release, err := service.reservePodCheckpointOutput(output)
+	reserved, release, err := service.reservePodCheckpointOutput(output)
 	require.NoError(t, err)
-	_, err = service.reservePodCheckpointOutput(output)
+	require.NotNil(t, reserved)
+	_, _, err = service.reservePodCheckpointOutput(output)
 	require.ErrorContains(t, err, "already in use")
 	release()
 
-	release, err = service.reservePodCheckpointOutput(output)
+	reserved, release, err = service.reservePodCheckpointOutput(output)
 	require.NoError(t, err)
+	require.NotNil(t, reserved)
 	release()
 
 	require.NoError(t, os.WriteFile(filepath.Join(output, "existing"), []byte("data"), 0o600))
-	_, err = service.reservePodCheckpointOutput(output)
+	_, _, err = service.reservePodCheckpointOutput(output)
 	require.ErrorContains(t, err, "must be empty")
+}
+
+func TestCheckpointOutputOperationsStayOnReservedDirectory(t *testing.T) {
+	service := new(CheckpointService)
+	parent := t.TempDir()
+	outputPath := filepath.Join(parent, "output")
+	require.NoError(t, os.Mkdir(outputPath, 0o700))
+
+	output, release, err := service.reservePodCheckpointOutput(outputPath)
+	require.NoError(t, err)
+	defer release()
+
+	originalPath := filepath.Join(parent, "original")
+	require.NoError(t, os.Rename(outputPath, originalPath))
+	require.NoError(t, os.Mkdir(outputPath, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(originalPath, "unrelated"), []byte("keep"), 0o600))
+
+	require.NoError(t, writePodCheckpointMetadataAt(output.dir, podCheckpointConfigFile, []byte(`{}`)))
+	_, err = os.Stat(filepath.Join(originalPath, podCheckpointConfigFile))
+	require.NoError(t, err)
+	_, err = os.Stat(filepath.Join(outputPath, podCheckpointConfigFile))
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	require.NoError(t, cleanupPartialCheckpoint(output.dir, []string{podCheckpointConfigFile}))
+	_, err = os.Stat(filepath.Join(originalPath, podCheckpointConfigFile))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	data, err := os.ReadFile(filepath.Join(originalPath, "unrelated"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("keep"), data)
 }
 
 func TestValidateCheckpointOutputPathRejectsUnsafePaths(t *testing.T) {
@@ -129,11 +160,11 @@ func TestValidateCheckpointOutputPathRejectsUnsafePaths(t *testing.T) {
 	require.NoError(t, os.Mkdir(realDir, 0o700))
 	symlink := filepath.Join(parent, "link")
 	require.NoError(t, os.Symlink(realDir, symlink))
-	require.ErrorContains(t, validateCheckpointOutputPath(symlink), "not a real directory")
+	require.ErrorContains(t, validateCheckpointOutputPath(symlink), "existing real directory")
 
 	file := filepath.Join(parent, "file")
 	require.NoError(t, os.WriteFile(file, nil, 0o600))
-	require.ErrorContains(t, validateCheckpointOutputPath(file), "not a real directory")
+	require.ErrorContains(t, validateCheckpointOutputPath(file), "existing real directory")
 }
 
 func TestPrepareRestoreContainersUsesOnlyOptionDataAndCheckpointFiles(t *testing.T) {
@@ -740,5 +771,19 @@ func TestWritePodCheckpointMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, entries, 1, "failed publication must remove its temporary file")
 		require.True(t, entries[0].IsDir())
+	})
+	t.Run("existing destination is not removed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, podCheckpointManifestFile)
+		existing := []byte("owned by another writer")
+		require.NoError(t, os.WriteFile(path, existing, 0o600))
+
+		require.Error(t, writePodCheckpointMetadata(path, []byte(`{}`)))
+		actual, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, existing, actual)
+		entries, err := os.ReadDir(dir)
+		require.NoError(t, err)
+		require.Len(t, entries, 1, "failed publication must remove only its temporary file")
 	})
 }

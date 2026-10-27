@@ -25,12 +25,14 @@ import (
 	"github.com/containerd/containerd/v2/internal/truncindex"
 	"github.com/containerd/containerd/v2/pkg/netns"
 	"github.com/containerd/errdefs"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 // Sandbox contains all resources associated with the sandbox. All methods to
 // mutate the internal state are thread safe.
 type Sandbox struct {
-	// Metadata is the metadata of the sandbox, it is immutable after created.
+	// Metadata is immutable after creation except for the Config pointer, which
+	// may be replaced atomically by Store.UpdateConfig.
 	Metadata
 	// Status stores the status of the sandbox.
 	Status StatusStorage
@@ -138,6 +140,27 @@ func (s *Store) List() []Sandbox {
 		sandboxes = append(sandboxes, sb)
 	}
 	return sandboxes
+}
+
+// UpdateConfig atomically replaces the sandbox config pointer without mutating
+// the config or any maps that may still be referenced by existing readers.
+func (s *Store) UpdateConfig(id string, config *runtime.PodSandboxConfig) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	id, err := s.idIndex.Get(id)
+	if err != nil {
+		if err == truncindex.ErrNotExist {
+			err = errdefs.ErrNotFound
+		}
+		return err
+	}
+	sb, ok := s.sandboxes[id]
+	if !ok {
+		return errdefs.ErrNotFound
+	}
+	sb.Config = config
+	s.sandboxes[id] = sb
+	return nil
 }
 
 // UpdateContainerStats updates the sandbox specified by ID with the

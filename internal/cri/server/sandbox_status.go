@@ -71,6 +71,9 @@ func (c *criService) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 		createdAt = cstatus.CreatedAt
 		info = cstatus.Info
 	}
+	if sandboxRestorePending(sandbox) {
+		state = runtime.PodSandboxState_SANDBOX_NOTREADY.String()
+	}
 
 	if info == nil {
 		info = make(map[string]string)

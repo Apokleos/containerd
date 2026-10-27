@@ -70,7 +70,9 @@ type directPodCgroupFreezer struct {
 }
 
 func loadPodCgroupFreezer(cgroupPath string) (podCgroupFreezer, error) {
-	if err := validatePodCgroupPath(cgroupPath); err != nil {
+	var err error
+	cgroupPath, err = resolvePodCgroupPath(cgroupPath)
+	if err != nil {
 		return nil, err
 	}
 
@@ -107,23 +109,39 @@ func loadPodCgroupFreezer(cgroupPath string) (podCgroupFreezer, error) {
 }
 
 func validatePodCgroupPath(cgroupPath string) error {
+	_, err := resolvePodCgroupPath(cgroupPath)
+	return err
+}
+
+func resolvePodCgroupPath(cgroupPath string) (string, error) {
 	if cgroupPath == "" {
-		return errors.New("pod checkpoint requires a pod cgroup parent, but the sandbox config has none")
+		return "", errors.New("pod checkpoint requires a pod cgroup parent, but the sandbox config has none")
 	}
 	if !filepath.IsAbs(cgroupPath) {
-		return fmt.Errorf("pod cgroup parent %q must be an absolute path", cgroupPath)
+		if filepath.Base(cgroupPath) != cgroupPath || !strings.HasSuffix(cgroupPath, ".slice") {
+			return "", fmt.Errorf("pod cgroup parent %q must be an absolute path or a systemd slice name", cgroupPath)
+		}
+		parts := strings.Split(strings.TrimSuffix(cgroupPath, ".slice"), "-")
+		pathParts := make([]string, 0, len(parts))
+		for i, part := range parts {
+			if part == "" {
+				return "", fmt.Errorf("pod cgroup parent %q is not a valid systemd slice name", cgroupPath)
+			}
+			pathParts = append(pathParts, strings.Join(parts[:i+1], "-")+".slice")
+		}
+		cgroupPath = string(filepath.Separator) + filepath.Join(pathParts...)
 	}
 	if filepath.Clean(cgroupPath) != cgroupPath {
-		return fmt.Errorf("pod cgroup parent %q must be a clean path", cgroupPath)
+		return "", fmt.Errorf("pod cgroup parent %q must be a clean path", cgroupPath)
 	}
 	if cgroupPath == string(filepath.Separator) {
-		return errors.New("refusing to freeze the root cgroup for a pod checkpoint")
+		return "", errors.New("refusing to freeze the root cgroup for a pod checkpoint")
 	}
 	const cgroupMountpoint = "/sys/fs/cgroup"
 	if cgroupPath == cgroupMountpoint || strings.HasPrefix(cgroupPath, cgroupMountpoint+string(filepath.Separator)) {
-		return fmt.Errorf("pod cgroup parent %q must be relative to the cgroup filesystem mountpoint", cgroupPath)
+		return "", fmt.Errorf("pod cgroup parent %q must be relative to the cgroup filesystem mountpoint", cgroupPath)
 	}
-	return nil
+	return cgroupPath, nil
 }
 
 func (f *directPodCgroupFreezer) State(ctx context.Context) (podCgroupState, error) {

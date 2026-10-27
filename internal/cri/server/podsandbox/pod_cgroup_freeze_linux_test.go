@@ -40,24 +40,27 @@ func TestValidatePodCgroupPath(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		path    string
+		want    string
 		wantErr string
 	}{
 		{name: "empty", wantErr: "sandbox config has none"},
-		{name: "relative", path: "kubepods/pod123", wantErr: "must be an absolute path"},
+		{name: "relative", path: "kubepods/pod123", wantErr: "must be an absolute path or a systemd slice name"},
 		{name: "unclean", path: "/kubepods/../pod123", wantErr: "must be a clean path"},
 		{name: "trailing separator", path: "/kubepods/pod123/", wantErr: "must be a clean path"},
 		{name: "root", path: "/", wantErr: "refusing to freeze the root cgroup"},
 		{name: "mountpoint", path: "/sys/fs/cgroup", wantErr: "must be relative to the cgroup filesystem mountpoint"},
 		{name: "path below mountpoint", path: "/sys/fs/cgroup/kubepods/pod123", wantErr: "must be relative to the cgroup filesystem mountpoint"},
-		{name: "cgroupfs", path: "/kubepods/burstable/pod123"},
-		{name: "systemd", path: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice"},
+		{name: "cgroupfs", path: "/kubepods/burstable/pod123", want: "/kubepods/burstable/pod123"},
+		{name: "expanded systemd", path: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice", want: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice"},
+		{name: "systemd slice", path: "kubepods-burstable-pod123.slice", want: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := validatePodCgroupPath(test.path)
+			resolved, err := resolvePodCgroupPath(test.path)
 			if test.wantErr == "" {
 				require.NoError(t, err)
+				assert.Equal(t, test.want, resolved)
 				return
 			}
 			require.ErrorContains(t, err, test.wantErr)

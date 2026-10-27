@@ -24,9 +24,12 @@ import (
 	"testing"
 	"time"
 
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/sandbox"
+	"github.com/containerd/containerd/v2/internal/cri/server/podsandbox"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
+	"github.com/containerd/containerd/v2/internal/eventq"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
 	"github.com/stretchr/testify/assert"
@@ -51,9 +54,10 @@ func (c *checkpointControllerStub) Restore(ctx context.Context, sandboxID string
 
 type checkpointSandboxService struct {
 	sandboxService
-	controller sandbox.Controller
-	sandboxer  string
-	err        error
+	controller       sandbox.Controller
+	sandboxer        string
+	err              error
+	controllerStatus sandbox.ControllerStatus
 }
 
 func (s *checkpointSandboxService) SandboxController(sandboxer string) (sandbox.Controller, error) {
@@ -61,11 +65,21 @@ func (s *checkpointSandboxService) SandboxController(sandboxer string) (sandbox.
 	return s.controller, s.err
 }
 
+func (s *checkpointSandboxService) SandboxStatus(context.Context, string, string, bool) (sandbox.ControllerStatus, error) {
+	return s.controllerStatus, s.err
+}
+
 func checkpointAPIContext(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+func TestRejectExternalRestoreAnnotation(t *testing.T) {
+	config := &runtime.PodSandboxConfig{Annotations: map[string]string{restoreAnnotation: "true"}}
+	require.ErrorContains(t, rejectExternalRestoreAnnotation(config), "reserved for containerd restore")
+	require.NoError(t, rejectExternalRestoreAnnotation(&runtime.PodSandboxConfig{}))
 }
 
 func TestCheckpointPodPassesDataToSelectedController(t *testing.T) {
@@ -249,22 +263,33 @@ func TestValidateRestoreResult(t *testing.T) {
 }
 
 type restoreOperationsStub struct {
-	calls        []string
-	containerIDs []string
-	createCalls  int
-	createErrAt  int
-	saveErr      error
-	saved        map[string]string
-	deleted      []string
+	calls                []string
+	contextErrs          []error
+	containerIDs         []string
+	createCalls          int
+	createErrAt          int
+	saveErr              error
+	saved                map[string]string
+	deleted              []string
+	runRequest           *runtime.RunPodSandboxRequest
+	createSandboxConfigs []*runtime.PodSandboxConfig
+	restoreContexts      []bool
+	publishErr           error
 }
 
-func (o *restoreOperationsStub) RunPodSandbox(_ context.Context, request *runtime.RunPodSandboxRequest) (*runtime.RunPodSandboxResponse, error) {
+func (o *restoreOperationsStub) RunPodSandbox(ctx context.Context, request *runtime.RunPodSandboxRequest) (*runtime.RunPodSandboxResponse, error) {
+	o.contextErrs = append(o.contextErrs, ctx.Err())
 	o.calls = append(o.calls, "run:"+request.GetRuntimeHandler())
+	o.runRequest = request
+	o.restoreContexts = append(o.restoreContexts, isPodRestore(ctx))
 	return &runtime.RunPodSandboxResponse{PodSandboxId: "new-sandbox"}, nil
 }
 
-func (o *restoreOperationsStub) CreateContainer(_ context.Context, request *runtime.CreateContainerRequest) (*runtime.CreateContainerResponse, error) {
+func (o *restoreOperationsStub) CreateContainer(ctx context.Context, request *runtime.CreateContainerRequest) (*runtime.CreateContainerResponse, error) {
+	o.contextErrs = append(o.contextErrs, ctx.Err())
+	o.createSandboxConfigs = append(o.createSandboxConfigs, request.GetSandboxConfig())
 	o.createCalls++
+	o.restoreContexts = append(o.restoreContexts, isPodRestore(ctx))
 	name := request.GetConfig().GetMetadata().GetName()
 	o.calls = append(o.calls, "create:"+name)
 	if o.createErrAt == o.createCalls {
@@ -273,7 +298,8 @@ func (o *restoreOperationsStub) CreateContainer(_ context.Context, request *runt
 	return &runtime.CreateContainerResponse{ContainerId: o.containerIDs[o.createCalls-1]}, nil
 }
 
-func (o *restoreOperationsStub) RemovePodSandbox(_ context.Context, request *runtime.RemovePodSandboxRequest) (*runtime.RemovePodSandboxResponse, error) {
+func (o *restoreOperationsStub) RemovePodSandbox(ctx context.Context, request *runtime.RemovePodSandboxRequest) (*runtime.RemovePodSandboxResponse, error) {
+	o.contextErrs = append(o.contextErrs, ctx.Err())
 	o.calls = append(o.calls, "remove:"+request.GetPodSandboxId())
 	return &runtime.RemovePodSandboxResponse{}, nil
 }
@@ -294,6 +320,12 @@ func (o *restoreOperationsStub) deleteTaskCheckpoint(_ context.Context, image st
 	o.calls = append(o.calls, "delete:"+image)
 	o.deleted = append(o.deleted, image)
 	return nil
+}
+
+func (o *restoreOperationsStub) publishRestoredSandbox(ctx context.Context, sandboxID string) error {
+	o.restoreContexts = append(o.restoreContexts, isPodRestore(ctx))
+	o.calls = append(o.calls, "publish:"+sandboxID)
+	return o.publishErr
 }
 
 func TestRestorePodResourcesKeepsSequencingInCRI(t *testing.T) {
@@ -327,7 +359,43 @@ func TestRestorePodResourcesKeepsSequencingInCRI(t *testing.T) {
 		"create:sidecar",
 		"controller:new-sandbox",
 		"save:new-app",
+		"publish:new-sandbox",
 	}, operations.calls)
+	assert.Equal(t, []bool{true, true, true, true}, operations.restoreContexts)
+}
+
+func TestRestorePodResourcesUsesConsistentClonedRestoreConfig(t *testing.T) {
+	request := restoreTransactionRequest()
+	request.Config.Annotations = map[string]string{"example.test/preserved": "true"}
+	options, err := restoreOptionsFromCRI(request)
+	require.NoError(t, err)
+	operations := &restoreOperationsStub{
+		containerIDs: []string{"new-app", "new-sidecar"},
+	}
+	controller := &checkpointControllerStub{
+		restore: func(_ context.Context, _ string, options sandbox.RestoreOptions) (sandbox.RestoreResult, error) {
+			config := new(runtime.PodSandboxConfig)
+			require.NoError(t, typeurl.UnmarshalTo(options.SandboxConfig, config))
+			assert.Equal(t, "true", config.GetAnnotations()["example.test/preserved"])
+			assert.Equal(t, "true", config.GetAnnotations()[restoreAnnotation])
+			return sandbox.RestoreResult{
+				RestoredContainers: []sandbox.RestoredContainer{{Name: "app"}, {Name: "sidecar"}},
+			}, nil
+		},
+	}
+
+	_, err = restorePodResources(context.Background(), request, options, controller, operations)
+	require.NoError(t, err)
+	require.NotNil(t, operations.runRequest)
+	assert.Equal(t, "true", operations.runRequest.GetConfig().GetAnnotations()[restoreAnnotation])
+	assert.Equal(t, "true", request.GetConfig().GetAnnotations()["example.test/preserved"])
+	_, requestHasRestoreAnnotation := request.GetConfig().GetAnnotations()[restoreAnnotation]
+	assert.False(t, requestHasRestoreAnnotation)
+	require.Len(t, operations.createSandboxConfigs, 2)
+	for _, config := range operations.createSandboxConfigs {
+		assert.Same(t, operations.runRequest.GetConfig(), config)
+	}
+	assert.Equal(t, []bool{true, true, true, true}, operations.restoreContexts)
 }
 
 func TestRestorePodResourcesRollsBackControllerArtifacts(t *testing.T) {
@@ -386,6 +454,195 @@ func TestRestorePodResourcesCleansTransferredTaskCheckpoint(t *testing.T) {
 		"delete:localhost/checkpoint:prepared",
 		"remove:new-sandbox",
 	}, operations.calls)
+}
+
+func TestRestorePodResourcesRollsBackPublishFailure(t *testing.T) {
+	request := restoreTransactionRequest()
+	request.ContainerConfigs = request.ContainerConfigs[:1]
+	options, err := restoreOptionsFromCRI(request)
+	require.NoError(t, err)
+	operations := &restoreOperationsStub{
+		containerIDs: []string{"new-app"},
+		publishErr:   errors.New("publish failed"),
+	}
+	controller := &checkpointControllerStub{
+		restore: func(context.Context, string, sandbox.RestoreOptions) (sandbox.RestoreResult, error) {
+			return sandbox.RestoreResult{
+				RestoredContainers: []sandbox.RestoredContainer{{Name: "app"}},
+			}, nil
+		},
+	}
+
+	_, err = restorePodResources(context.Background(), request, options, controller, operations)
+	require.ErrorContains(t, err, "publish failed")
+	assert.Equal(t, []string{
+		"run:vm-runtime",
+		"create:app",
+		"publish:new-sandbox",
+		"remove:new-sandbox",
+	}, operations.calls)
+}
+
+func TestPublishRestoredSandbox(t *testing.T) {
+	createdAt := time.Now().UTC()
+	stored := sandbox.Sandbox{ID: "sandbox-1"}
+	require.NoError(t, stored.AddExtension(podsandbox.MetadataKey, &sandboxstore.Metadata{
+		ID: "sandbox-1",
+		Config: &runtime.PodSandboxConfig{Annotations: map[string]string{
+			restoreAnnotation:       "true",
+			"example.test/retained": "true",
+		}, Linux: &runtime.LinuxPodSandboxConfig{
+			SecurityContext: &runtime.LinuxSandboxSecurityContext{
+				NamespaceOptions: &runtime.NamespaceOption{Network: runtime.NamespaceMode_NODE},
+			},
+		}},
+	}))
+	metadataStore := &restoreMetadataSandboxStore{stored: stored}
+	cri := newTestCRIService(func(service *criService) {
+		client, err := containerd.New("", containerd.WithServices(containerd.WithSandboxStore(metadataStore)))
+		require.NoError(t, err)
+		service.client = client
+	})
+	cri.containerEventsQ = eventq.New[*runtime.ContainerEventResponse](time.Minute, func(*runtime.ContainerEventResponse) {})
+	t.Cleanup(cri.containerEventsQ.Shutdown)
+	events, eventsCloser := cri.containerEventsQ.Subscribe()
+	t.Cleanup(func() { require.NoError(t, eventsCloser.Close()) })
+	cri.sandboxService = &checkpointSandboxService{
+		controllerStatus: sandbox.ControllerStatus{
+			SandboxID: "sandbox-1",
+			Pid:       42,
+			State:     runtime.PodSandboxState_SANDBOX_READY.String(),
+			CreatedAt: createdAt,
+		},
+	}
+	sb := sandboxstore.NewSandbox(
+		sandboxstore.Metadata{
+			ID: "sandbox-1",
+			Config: &runtime.PodSandboxConfig{
+				Annotations: map[string]string{restoreAnnotation: "true"},
+				Linux: &runtime.LinuxPodSandboxConfig{
+					SecurityContext: &runtime.LinuxSandboxSecurityContext{
+						NamespaceOptions: &runtime.NamespaceOption{Network: runtime.NamespaceMode_NODE},
+					},
+				},
+			},
+		},
+		sandboxstore.Status{State: sandboxstore.StateUnknown},
+	)
+	sb.Sandboxer = "shim"
+	require.NoError(t, cri.sandboxStore.Add(sb))
+
+	require.NoError(t, cri.publishRestoredSandbox(context.Background(), sb.ID))
+	status := sb.Status.Get()
+	assert.Equal(t, sandboxstore.StateReady, status.State)
+	assert.Equal(t, uint32(42), status.Pid)
+	assert.Equal(t, createdAt, status.CreatedAt)
+	require.NotNil(t, metadataStore.updated)
+	persisted := sandboxstore.Metadata{}
+	require.NoError(t, metadataStore.updated.GetExtension(podsandbox.MetadataKey, &persisted))
+	_, hasRestoreAnnotation := persisted.Config.GetAnnotations()[restoreAnnotation]
+	assert.False(t, hasRestoreAnnotation)
+	assert.Equal(t, "true", persisted.Config.GetAnnotations()["example.test/retained"])
+	live, err := cri.sandboxStore.Get(sb.ID)
+	require.NoError(t, err)
+	_, hasRestoreAnnotation = live.Config.GetAnnotations()[restoreAnnotation]
+	assert.False(t, hasRestoreAnnotation)
+	select {
+	case event := <-events:
+		assert.Equal(t, runtime.ContainerEventType_CONTAINER_STARTED_EVENT, event.GetContainerEventType())
+		assert.Equal(t, sb.ID, event.GetContainerId())
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for restored sandbox STARTED event")
+	}
+}
+
+func TestPublishRestoredSandboxRejectsExitedSandbox(t *testing.T) {
+	cri := newTestCRIService()
+	cri.sandboxService = &checkpointSandboxService{
+		controllerStatus: sandbox.ControllerStatus{
+			SandboxID: "sandbox-1",
+			State:     runtime.PodSandboxState_SANDBOX_READY.String(),
+		},
+	}
+	sb := sandboxstore.NewSandbox(
+		sandboxstore.Metadata{
+			ID: "sandbox-1",
+			Config: &runtime.PodSandboxConfig{Annotations: map[string]string{
+				restoreAnnotation: "true",
+			}},
+		},
+		sandboxstore.Status{State: sandboxstore.StateNotReady},
+	)
+	sb.Sandboxer = "shim"
+	require.NoError(t, cri.sandboxStore.Add(sb))
+
+	err := cri.publishRestoredSandbox(context.Background(), sb.ID)
+	require.ErrorContains(t, err, "cannot be published")
+	assert.Equal(t, sandboxstore.StateNotReady, sb.Status.Get().State)
+	assert.False(t, sandboxRestoreInProgress(sb))
+	assert.True(t, sandboxRestorePending(sb))
+}
+
+func TestPublishRestoredSandboxRejectsExitDuringCommit(t *testing.T) {
+	stored := sandbox.Sandbox{ID: "sandbox-1"}
+	require.NoError(t, stored.AddExtension(podsandbox.MetadataKey, &sandboxstore.Metadata{
+		ID: "sandbox-1",
+		Config: &runtime.PodSandboxConfig{Annotations: map[string]string{
+			restoreAnnotation: "true",
+		}},
+	}))
+	metadataStore := &restoreMetadataSandboxStore{stored: stored}
+	cri := newTestCRIService(func(service *criService) {
+		client, err := containerd.New("", containerd.WithServices(containerd.WithSandboxStore(metadataStore)))
+		require.NoError(t, err)
+		service.client = client
+	})
+	cri.sandboxService = &checkpointSandboxService{
+		controllerStatus: sandbox.ControllerStatus{
+			SandboxID: "sandbox-1",
+			State:     runtime.PodSandboxState_SANDBOX_READY.String(),
+		},
+	}
+	sb := sandboxstore.NewSandbox(
+		sandboxstore.Metadata{
+			ID: "sandbox-1",
+			Config: &runtime.PodSandboxConfig{Annotations: map[string]string{
+				restoreAnnotation: "true",
+			}},
+		},
+		sandboxstore.Status{State: sandboxstore.StateUnknown},
+	)
+	sb.Sandboxer = "shim"
+	require.NoError(t, cri.sandboxStore.Add(sb))
+	metadataStore.onUpdate = func() {
+		require.NoError(t, sb.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
+			status.State = sandboxstore.StateNotReady
+			return status, nil
+		}))
+	}
+
+	err := cri.publishRestoredSandbox(context.Background(), sb.ID)
+	require.ErrorContains(t, err, "cannot be published")
+	assert.Equal(t, sandboxstore.StateNotReady, sb.Status.Get().State)
+}
+
+type restoreMetadataSandboxStore struct {
+	sandbox.Store
+	stored   sandbox.Sandbox
+	updated  *sandbox.Sandbox
+	onUpdate func()
+}
+
+func (s *restoreMetadataSandboxStore) Get(context.Context, string) (sandbox.Sandbox, error) {
+	return s.stored, nil
+}
+
+func (s *restoreMetadataSandboxStore) Update(_ context.Context, stored sandbox.Sandbox, _ ...string) (sandbox.Sandbox, error) {
+	s.updated = &stored
+	if s.onUpdate != nil {
+		s.onUpdate()
+	}
+	return stored, nil
 }
 
 func TestRestorePodResourcesRollsBackCreateFailure(t *testing.T) {

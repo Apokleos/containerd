@@ -34,6 +34,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/containerd/v2/client"
@@ -45,7 +46,6 @@ import (
 	crilabels "github.com/containerd/containerd/v2/internal/cri/labels"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
-	"github.com/containerd/containerd/v2/pkg/atomicfile"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
@@ -71,6 +71,17 @@ const (
 	maxCheckpointArchiveEntries  = 100_000
 	maxPodCheckpointContainers   = 1024
 )
+
+var checkpointTempSequence atomic.Uint64
+
+type podCheckpointOutputKey struct {
+	device uint64
+	inode  uint64
+}
+
+type podCheckpointOutput struct {
+	dir *os.File
+}
 
 type podCheckpointManifest struct {
 	Version    int                              `json:"version"`
@@ -121,7 +132,7 @@ func (c *CheckpointService) Checkpoint(ctx context.Context, sandboxID string, op
 	if err := validatePodCheckpointOptions(opts.Options); err != nil {
 		return err
 	}
-	releaseOutput, err := c.reservePodCheckpointOutput(opts.OutputPath)
+	output, releaseOutput, err := c.reservePodCheckpointOutput(opts.OutputPath)
 	if err != nil {
 		return err
 	}
@@ -141,9 +152,10 @@ func (c *CheckpointService) Checkpoint(ctx context.Context, sandboxID string, op
 	}
 
 	completed := false
+	var publishedFiles []string
 	defer func() {
 		if !completed {
-			if err := cleanupPartialCheckpoint(opts.OutputPath); err != nil {
+			if err := cleanupPartialCheckpoint(output.dir, publishedFiles); err != nil {
 				log.G(ctx).WithError(err).Errorf("failed to clean partial Pod checkpoint %q", opts.OutputPath)
 			}
 		}
@@ -152,9 +164,10 @@ func (c *CheckpointService) Checkpoint(ctx context.Context, sandboxID string, op
 	if err != nil {
 		return fmt.Errorf("failed to marshal sandbox config: %w", err)
 	}
-	if err := writePodCheckpointMetadata(filepath.Join(opts.OutputPath, podCheckpointConfigFile), configData); err != nil {
+	if err := writePodCheckpointMetadataAt(output.dir, podCheckpointConfigFile, configData); err != nil {
 		return fmt.Errorf("failed to write sandbox config: %w", err)
 	}
+	publishedFiles = append(publishedFiles, podCheckpointConfigFile)
 
 	containerIDs := make([]string, 0, len(containers))
 	tasks := make([]podCheckpointRuntimeTask, 0, len(containers))
@@ -238,19 +251,20 @@ func (c *CheckpointService) Checkpoint(ctx context.Context, sandboxID string, op
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("pod checkpoint export aborted: %w", err)
 		}
-		archivePath := filepath.Join(opts.OutputPath, container.manifest.Archive)
-		if err := c.exportCheckpointImageAtomic(ctx, checkpointImages[i], archivePath); err != nil {
+		if err := c.exportCheckpointImageAtomic(ctx, checkpointImages[i], output.dir, container.manifest.Archive); err != nil {
 			return fmt.Errorf("failed to export checkpoint for container %q: %w", container.name, err)
 		}
+		publishedFiles = append(publishedFiles, container.manifest.Archive)
 	}
 
 	manifestData, err := json.Marshal(manifest)
 	if err != nil {
 		return fmt.Errorf("failed to marshal checkpoint manifest: %w", err)
 	}
-	if err := writePodCheckpointMetadata(filepath.Join(opts.OutputPath, podCheckpointManifestFile), manifestData); err != nil {
+	if err := writePodCheckpointMetadataAt(output.dir, podCheckpointManifestFile, manifestData); err != nil {
 		return fmt.Errorf("failed to write checkpoint manifest: %w", err)
 	}
+	publishedFiles = append(publishedFiles, podCheckpointManifestFile)
 	completed = true
 	return nil
 }
@@ -258,18 +272,63 @@ func (c *CheckpointService) Checkpoint(ctx context.Context, sandboxID string, op
 // writePodCheckpointMetadata persists the file contents before publishing the
 // name, then persists the directory entry before reporting success.
 func writePodCheckpointMetadata(path string, data []byte) error {
-	file, err := atomicfile.New(path, 0o600)
+	dir, err := openCheckpointDirectory(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	defer file.Cancel()
+	defer dir.Close()
+	return writePodCheckpointMetadataAt(dir, filepath.Base(path), data)
+}
+
+func writePodCheckpointMetadataAt(dir *os.File, name string, data []byte) (retErr error) {
+	file, tempName, err := createCheckpointTempFile(dir)
+	if err != nil {
+		return err
+	}
+	closed := false
+	published := false
+	defer func() {
+		if !closed {
+			retErr = errors.Join(retErr, file.Close())
+		}
+		if err := unix.Unlinkat(int(dir.Fd()), tempName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			retErr = errors.Join(retErr, err)
+		}
+		if retErr != nil && published {
+			if err := unix.Unlinkat(int(dir.Fd()), name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+				retErr = errors.Join(retErr, err)
+			}
+		}
+	}()
 	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
 		return err
 	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(path))
+	closed = true
+	if err := unix.Renameat2(int(dir.Fd()), tempName, int(dir.Fd()), name, unix.RENAME_NOREPLACE); err != nil {
+		return err
+	}
+	published = true
+	return dir.Sync()
+}
+
+func createCheckpointTempFile(dir *os.File) (*os.File, string, error) {
+	for {
+		name := fmt.Sprintf(".checkpoint-tmp-%d-%d", os.Getpid(), checkpointTempSequence.Add(1))
+		fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		return os.NewFile(uintptr(fd), name), name, nil
+	}
 }
 
 func (c *CheckpointService) Restore(ctx context.Context, sandboxID string, opts sandbox.RestoreOptions) (_ sandbox.RestoreResult, retErr error) {
@@ -449,24 +508,26 @@ func withCheckpointWorkPath(path string) client.CheckpointOpts {
 	}
 }
 
-func (c *CheckpointService) exportCheckpointImageAtomic(ctx context.Context, imageName, destination string) (retErr error) {
-	temp, err := os.CreateTemp(filepath.Dir(destination), ".checkpoint-image-")
+func (c *CheckpointService) exportCheckpointImageAtomic(ctx context.Context, imageName string, dir *os.File, destination string) (retErr error) {
+	temp, tempName, err := createCheckpointTempFile(dir)
 	if err != nil {
 		return fmt.Errorf("failed to create temporary checkpoint archive: %w", err)
 	}
-	tempPath := temp.Name()
 	tempClosed := false
+	published := false
 	defer func() {
 		if !tempClosed {
 			retErr = errors.Join(retErr, temp.Close())
 		}
-		if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := unix.Unlinkat(int(dir.Fd()), tempName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			retErr = errors.Join(retErr, err)
 		}
+		if retErr != nil && published {
+			if err := unix.Unlinkat(int(dir.Fd()), destination, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+				retErr = errors.Join(retErr, err)
+			}
+		}
 	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
 	if err := c.client.Export(ctx, temp,
 		imagearchive.WithImage(c.client.ImageService(), imageName),
 		imagearchive.WithSkipDockerManifest(),
@@ -480,10 +541,11 @@ func (c *CheckpointService) exportCheckpointImageAtomic(ctx context.Context, ima
 		return err
 	}
 	tempClosed = true
-	if err := os.Rename(tempPath, destination); err != nil {
+	if err := unix.Renameat2(int(dir.Fd()), tempName, int(dir.Fd()), destination, unix.RENAME_NOREPLACE); err != nil {
 		return fmt.Errorf("failed to publish checkpoint archive %q: %w", destination, err)
 	}
-	return syncDirectory(filepath.Dir(destination))
+	published = true
+	return dir.Sync()
 }
 
 func prepareRestoreContainers(opts sandbox.RestoreOptions) (_ []restoreContainer, retErr error) {
@@ -914,63 +976,68 @@ func validateCheckpointDescriptorContent(ctx context.Context, provider content.P
 }
 
 func validateCheckpointOutputPath(checkpointDir string) error {
+	dir, err := openEmptyCheckpointOutput(checkpointDir)
+	if err != nil {
+		return err
+	}
+	return dir.Close()
+}
+
+func (c *CheckpointService) reservePodCheckpointOutput(checkpointDir string) (*podCheckpointOutput, func(), error) {
+	dir, err := openEmptyCheckpointOutput(checkpointDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(dir.Fd()), &stat); err != nil {
+		dir.Close()
+		return nil, nil, fmt.Errorf("failed to inspect checkpoint output directory %q: %w", checkpointDir, err)
+	}
+	key := podCheckpointOutputKey{device: uint64(stat.Dev), inode: stat.Ino}
+	if _, loaded := c.podCheckpointOutputsInProgress.LoadOrStore(key, struct{}{}); loaded {
+		dir.Close()
+		return nil, nil, fmt.Errorf("checkpoint output directory %q is already in use by another checkpoint", checkpointDir)
+	}
+	output := &podCheckpointOutput{dir: dir}
+	release := func() {
+		c.podCheckpointOutputsInProgress.Delete(key)
+		_ = dir.Close()
+	}
+	return output, release, nil
+}
+
+func openEmptyCheckpointOutput(checkpointDir string) (*os.File, error) {
 	if checkpointDir == "" {
-		return errors.New("checkpoint output path is required")
+		return nil, errors.New("checkpoint output path is required")
 	}
 	if !filepath.IsAbs(checkpointDir) {
-		return fmt.Errorf("checkpoint output path %q must be absolute", checkpointDir)
+		return nil, fmt.Errorf("checkpoint output path %q must be absolute", checkpointDir)
 	}
-	info, err := os.Lstat(checkpointDir)
+	dir, err := openCheckpointDirectory(checkpointDir)
 	if err != nil {
-		return fmt.Errorf("checkpoint output path %q must be an existing directory: %w", checkpointDir, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("checkpoint output path %q is not a real directory", checkpointDir)
-	}
-	entries, err := os.ReadDir(checkpointDir)
-	if err != nil {
-		return fmt.Errorf("failed to read checkpoint output directory %q: %w", checkpointDir, err)
-	}
-	if len(entries) != 0 {
-		return fmt.Errorf("checkpoint output directory %q must be empty", checkpointDir)
-	}
-	return nil
-}
-
-func (c *CheckpointService) reservePodCheckpointOutput(checkpointDir string) (func(), error) {
-	if err := validateCheckpointOutputPath(checkpointDir); err != nil {
 		return nil, err
 	}
-	canonicalDir, err := filepath.EvalSymlinks(checkpointDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve checkpoint output path %q: %w", checkpointDir, err)
+	entries, err := dir.ReadDir(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		dir.Close()
+		return nil, fmt.Errorf("failed to read checkpoint output directory %q: %w", checkpointDir, err)
 	}
-	canonicalDir = filepath.Clean(canonicalDir)
-	if _, loaded := c.podCheckpointOutputsInProgress.LoadOrStore(canonicalDir, struct{}{}); loaded {
-		return nil, fmt.Errorf("checkpoint output directory %q is already in use by another checkpoint", checkpointDir)
+	if len(entries) != 0 {
+		dir.Close()
+		return nil, fmt.Errorf("checkpoint output directory %q must be empty", checkpointDir)
 	}
-	return func() {
-		c.podCheckpointOutputsInProgress.Delete(canonicalDir)
-	}, nil
+	return dir, nil
 }
 
-func cleanupPartialCheckpoint(checkpointDir string) error {
-	info, err := os.Lstat(checkpointDir)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("checkpoint output path %q is no longer a directory", checkpointDir)
-	}
-	entries, err := os.ReadDir(checkpointDir)
-	if err != nil {
-		return err
-	}
+func cleanupPartialCheckpoint(dir *os.File, names []string) error {
 	var cleanupErrors []error
-	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(checkpointDir, entry.Name())); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove %q: %w", entry.Name(), err))
+	for _, name := range names {
+		if err := unix.Unlinkat(int(dir.Fd()), name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove %q: %w", name, err))
 		}
+	}
+	if len(names) != 0 {
+		cleanupErrors = append(cleanupErrors, dir.Sync())
 	}
 	return errors.Join(cleanupErrors...)
 }

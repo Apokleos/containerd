@@ -187,3 +187,20 @@ func TestSandboxStore(t *testing.T) {
 		assert.Equal(errdefs.ErrNotFound, err)
 	}
 }
+
+func TestSandboxStoreUpdateConfig(t *testing.T) {
+	store := NewStore(label.NewStore(), nil)
+	originalConfig := &runtime.PodSandboxConfig{Annotations: map[string]string{"old": "true"}}
+	sb := NewSandbox(Metadata{ID: "sandbox-1", Config: originalConfig}, Status{State: StateUnknown})
+	assert := assertlib.New(t)
+	assert.NoError(store.Add(sb))
+
+	updatedConfig := &runtime.PodSandboxConfig{Annotations: map[string]string{"new": "true"}}
+	assert.NoError(store.UpdateConfig("sandbox-1", updatedConfig))
+	updated, err := store.Get("sandbox-1")
+	assert.NoError(err)
+	assert.Same(updatedConfig, updated.Config)
+	assert.Same(originalConfig, sb.Config)
+	assert.Equal(StateUnknown, updated.Status.Get().State)
+	assert.ErrorIs(store.UpdateConfig("missing", updatedConfig), errdefs.ErrNotFound)
+}

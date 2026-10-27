@@ -121,9 +121,14 @@ func (c *criService) recover(ctx context.Context) error {
 		}
 
 		var (
-			state    = sandboxstore.StateUnknown
-			endpoint sandboxstore.Endpoint
+			restorePending = hasRestoreAnnotation(metadata.Config)
+			state          = sandboxstore.StateUnknown
+			endpoint       sandboxstore.Endpoint
 		)
+		if restorePending {
+			state = sandboxstore.StateNotReady
+			log.G(ctx).WithField("sandbox", sbx.ID).Warn("Recovering an incomplete pod restore as not ready")
+		}
 
 		status, err := c.sandboxService.SandboxStatus(ctx, sbx.Sandboxer, sbx.ID, false)
 		if err != nil {
@@ -138,13 +143,7 @@ func (c *criService) recover(ctx context.Context) error {
 		} else {
 			endpoint.Version = status.Version
 			endpoint.Address = status.Address
-			if code, ok := runtime.PodSandboxState_value[status.State]; ok {
-				if code == int32(runtime.PodSandboxState_SANDBOX_READY) {
-					state = sandboxstore.StateReady
-				} else if code == int32(runtime.PodSandboxState_SANDBOX_NOTREADY) {
-					state = sandboxstore.StateNotReady
-				}
-			}
+			state = recoveredSandboxState(status.State, restorePending)
 		}
 
 		sb := sandboxstore.NewSandbox(metadata, sandboxstore.Status{State: state})
@@ -246,6 +245,21 @@ func (c *criService) recover(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func recoveredSandboxState(controllerState string, restorePending bool) sandboxstore.State {
+	if restorePending {
+		return sandboxstore.StateNotReady
+	}
+	if code, ok := runtime.PodSandboxState_value[controllerState]; ok {
+		if code == int32(runtime.PodSandboxState_SANDBOX_READY) {
+			return sandboxstore.StateReady
+		}
+		if code == int32(runtime.PodSandboxState_SANDBOX_NOTREADY) {
+			return sandboxstore.StateNotReady
+		}
+	}
+	return sandboxstore.StateUnknown
 }
 
 // loadContainerTimeout is the default timeout for loading a container/sandbox.

@@ -75,7 +75,8 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		sandboxID  = cstatus.SandboxID
 		sandboxPid = cstatus.Pid
 	)
-	if sandbox.Status.Get().State != sandboxstore.StateReady {
+	if sandbox.Status.Get().State != sandboxstore.StateReady &&
+		!(isPodRestore(ctx) && sandboxRestoreInProgress(sandbox)) {
 		return nil, fmt.Errorf("sandbox container %q is not running", sandboxID)
 	}
 	span.SetAttributes(

@@ -191,6 +191,16 @@ The `enable_checkpoint_restore` setting applies to all controllers. The
 pause-container controller checks host CRIU availability and version; custom
 controllers are responsible for their own runtime requirements.
 
+During `RestorePod`, CRI injects the reserved
+`io.containerd.restore=true` sandbox annotation into an internal clone of the
+sandbox config. The annotation is a containerd internal control signal that a
+runtime can use to defer normal sandbox startup until `Restore` loads the
+checkpointed state.
+CRI callers must not set it; ordinary `RunPodSandbox` and incoming `RestorePod`
+requests that contain it are rejected. Containerd persists the annotation as
+an incomplete-restore marker and removes it before publishing the restored
+sandbox as Ready.
+
 The boundary is data-only. Sandbox and container configurations, selected
 container status, runtime options, paths, and restored container results are
 carried by `CheckpointOptions`, `RestoreOptions`, `RestoreResult`, and their RPC
